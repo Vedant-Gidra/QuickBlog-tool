@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+/* ===================== IMPORTS ===================== */
 import fs from "fs";
 import path from "path";
 import readline from "readline";
@@ -11,10 +12,9 @@ import * as walk from "acorn-walk";
 const SUPPORTED_FILES = [".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".html"];
 
 /* ===================== PRINT HELPER ===================== */
-function printMetricBlock(title, content) {
+function printMetricBlock(title, content) {  
   console.log(`======= ${title} =======`);
   console.log(content);
-  console.log('\n');
 }
 
 /* ===================== FILE SCAN (node_modules excluded) ===================== */
@@ -23,7 +23,6 @@ function scanFiles(dir, list = []) {
     if (item === "node_modules") continue; // UPDATED
 
     const full = path.join(dir, item);
-
     if (fs.statSync(full).isDirectory()) {
       scanFiles(full, list);
     } else if (SUPPORTED_FILES.includes(path.extname(full))) {
@@ -97,67 +96,55 @@ function cyclomatic(ast) {
   return cc;
 }
 
-/* ===================== INFORMATION FLOW ===================== */
+/* ===================== INFORMATION FLOW (FIXED) ===================== */
 function infoFlow(ast) {
-  const functions = new Map(); 
+  const functions = new Map();
   let currentFunction = "GLOBAL";
 
-  function registerFunction(name) {
+  function register(name) {
     if (!functions.has(name)) {
       functions.set(name, { fanIn: new Set(), fanOut: new Set() });
     }
   }
 
-  registerFunction(currentFunction);
+  register(currentFunction);
 
   walk.ancestor(ast, {
-    FunctionDeclaration(node, ancestors) {
-      const name = node.id?.name || "anonymous";
-      registerFunction(name);
+    FunctionDeclaration(n) {
+      const name = n.id?.name || "anonymous";
+      register(name);
       currentFunction = name;
     },
-
-    FunctionExpression(node, ancestors) {
-      const name = node.id?.name || "anonymous_expr";
-      registerFunction(name);
+    FunctionExpression(n) {
+      const name = n.id?.name || "anonymous_expr";
+      register(name);
       currentFunction = name;
     },
-
-    ArrowFunctionExpression(node, ancestors) {
-      const name = "arrow@" + node.start;
-      registerFunction(name);
+    ArrowFunctionExpression(n) {
+      const name = "arrow@" + n.start;
+      register(name);
       currentFunction = name;
     },
-
-    MethodDefinition(node) {
-      const name = node.key.name;
-      registerFunction(name);
+    MethodDefinition(n) {
+      const name = n.key.name;
+      register(name);
       currentFunction = name;
     },
-
-    CallExpression(node, ancestors) {
-      const calleeName = node.callee.name;
-      if (!calleeName) return;
-
-      registerFunction(calleeName);
-
-      functions.get(currentFunction).fanOut.add(calleeName);
-
-      functions.get(calleeName).fanIn.add(currentFunction);
+    CallExpression(n) {
+      const callee = n.callee.name;
+      if (!callee) return;
+      register(callee);
+      functions.get(currentFunction).fanOut.add(callee);
+      functions.get(callee).fanIn.add(currentFunction);
     }
   });
 
-  let functionCount = 0;
-  let totalFanIn = 0;
-  let totalFanOut = 0;
-  let totalInfoFlow = 0;
+  let functionCount = 0, totalFanIn = 0, totalFanOut = 0, totalInfoFlow = 0;
 
-  for (const [name, data] of functions.entries()) {
+  for (const [name, v] of functions.entries()) {
     if (name === "GLOBAL") continue;
-
-    const fin = data.fanIn.size;
-    const fout = data.fanOut.size;
-
+    const fin = v.fanIn.size;
+    const fout = v.fanOut.size;
     functionCount++;
     totalFanIn += fin;
     totalFanOut += fout;
@@ -189,13 +176,8 @@ function liveVariableStats(ast, loc) {
     Identifier(n) { used.add(n.name); }
   });
 
-  const liveCount = [...declared].filter(v => used.has(v)).length;
-
-  return {
-    declared: declared.size,
-    live: liveCount,
-    loc
-  };
+  const live = [...declared].filter(v => used.has(v)).length;
+  return { declared: declared.size, live, loc };
 }
 
 /* ===================== DISPERSION ===================== */
@@ -205,23 +187,34 @@ function dispersion(arr) {
   return { mean, variance, stdDev: Math.sqrt(variance) };
 }
 
+/* ===================== CSV WRITER ===================== */
+function writeCSV(report, filePath) {
+  let csv = "Metric,Value\n";
+  for (const [k, v] of Object.entries(report)) {
+    csv += `${k},${v}\n`;
+  }
+  fs.writeFileSync(filePath, csv, "utf8");
+}
+
 /* ===================== MAIN ===================== */
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-rl.question("Enter project folder path: ", root => {
+rl.question("Enter project folder path: ", inputPath => {
 
+  const root = inputPath.trim(); // UPDATED: path sanitization
   const files = scanFiles(root);
 
   let locArr = [];
   let ccTotal = 0;
 
-  // Halstead aggregation
   const totalHalstead = {
     N1: 0, N2: 0, n1: 0, n2: 0,
     volume: 0, effort: 0, time: 0, bugs: 0
   };
 
-  // UPDATED: Information Flow aggregation
+  let totalVarsDeclared = 0, totalLiveVars = 0, maxLiveVars = 0;
+  let totalLOCForLive = 0, liveFileCount = 0;
+
   let infoFlowSummary = {
     functionCount: 0,
     totalFanIn: 0,
@@ -230,13 +223,6 @@ rl.question("Enter project folder path: ", root => {
     grandTotal: 0
   };
 
-  // Live variable aggregation
-  let totalVarsDeclared = 0;
-  let totalLiveVars = 0;
-  let maxLiveVars = 0;
-  let totalLOCForLive = 0;
-  let liveFileCount = 0;
-
   for (const file of files) {
     const content = fs.readFileSync(file, "utf8");
     const loc = locMetrics(content);
@@ -244,13 +230,15 @@ rl.question("Enter project folder path: ", root => {
 
     if (file.endsWith(".js")) {
       try {
-        const ast = acorn.parse(content, {
-          ecmaVersion: "latest",
-          sourceType: "module"
-        });
+        const ast = acorn.parse(content, { ecmaVersion: "latest", sourceType: "module" });
 
-        // Halstead
         const h = halstead(ast);
+        const cc = cyclomatic(ast);
+        const ifm = infoFlow(ast);
+        const lv = liveVariableStats(ast, loc.code);
+
+        ccTotal += cc;
+
         totalHalstead.N1 += h.N1;
         totalHalstead.N2 += h.N2;
         totalHalstead.n1 += h.n1;
@@ -260,19 +248,12 @@ rl.question("Enter project folder path: ", root => {
         totalHalstead.time += h.time;
         totalHalstead.bugs += h.bugs;
 
-        // Cyclomatic
-        ccTotal += cyclomatic(ast);
-
-        //Information Flow
-        const ifm = infoFlow(ast);
         infoFlowSummary.functionCount += ifm.functionCount;
         infoFlowSummary.totalFanIn += ifm.totalFanIn;
         infoFlowSummary.totalFanOut += ifm.totalFanOut;
         infoFlowSummary.totalInfoFlow += ifm.totalInfoFlow;
         infoFlowSummary.grandTotal += ifm.grandTotal;
 
-        // Live Variables
-        const lv = liveVariableStats(ast, loc.code);
         totalVarsDeclared += lv.declared;
         totalLiveVars += lv.live;
         maxLiveVars = Math.max(maxLiveVars, lv.live);
@@ -288,85 +269,68 @@ rl.question("Enter project folder path: ", root => {
   const totalLOC = locArr.reduce((a,b)=>a+b,0);
   const disp = dispersion(locArr);
 
+  /* ===================== UPDATED: MAINTAINABILITY INDEX ===================== */
   const MI =
-    171 -
-    5.2 * Math.log(totalHalstead.volume || 1) -
-    0.23 * ccTotal -
-    16.2 * Math.log(totalLOC || 1);
+    5.2 * Math.log(totalHalstead.volume || 1) +
+    0.23 * ccTotal +
+    16.2 * Math.log(totalLOC || 1) - 171;
 
+  /* ===================== UPDATED: INTEROPERABILITY INDEX ===================== */
   const interoperabilityScore = (42 / 50) * 100;
 
-  /* ===================== PRINTING ===================== */
+  /* ===================== CONSOLE OUTPUT ===================== */
 
-  printMetricBlock(
-    "SOFTWARE METRICS REPORT",
-    `
-Files Analyzed: ${files.length}
-Total Lines of Code (LOC): ${totalLOC}
-`.trim()
-  );
+  printMetricBlock("SOFTWARE METRICS REPORT",
+    `Files Analyzed: ${files.length}\nTotal LOC: ${totalLOC}`);
 
-  printMetricBlock(
-    "HALSTEAD METRICS (DETAILED)",
-    `
-Total Operators (N1): ${totalHalstead.N1}
-Total Operands (N2): ${totalHalstead.N2}
-Program Vocabulary (n): ${totalHalstead.n1 + totalHalstead.n2}
-Program Length (N): ${totalHalstead.N1 + totalHalstead.N2}
-Volume: ${totalHalstead.volume.toFixed(2)}
-Effort: ${totalHalstead.effort.toFixed(2)}
-Time (seconds): ${totalHalstead.time.toFixed(2)}
-Estimated Bugs: ${totalHalstead.bugs.toFixed(4)}
-`.trim()
-  );
+  printMetricBlock("HALSTEAD METRICS (SUMMARY)",
+    `Volume: ${totalHalstead.volume.toFixed(2)}\nEffort: ${totalHalstead.effort.toFixed(2)}\nBugs: ${totalHalstead.bugs.toFixed(4)}`);
 
-  printMetricBlock(
-    "CYCLOMATIC COMPLEXITY",
-    `Cyclomatic Complexity: ${ccTotal}`
-  );
+  printMetricBlock("CYCLOMATIC COMPLEXITY",
+    `Cyclomatic Complexity: ${ccTotal}`);
 
-  printMetricBlock(
-    "MAINTAINABILITY INDEX",
-    `Maintainability Index (MI): ${MI.toFixed(2)}`
-  );
+  /* UPDATED: Maintainability Index printed explicitly */
+  printMetricBlock("MAINTAINABILITY INDEX",
+    `Maintainability Index (MI): ${MI.toFixed(2)}`);
 
-  printMetricBlock(
-    "MEASURE OF DISPERSION (LOC)",
-    `
-Mean LOC per File: ${disp.mean.toFixed(2)}
-Variance: ${disp.variance.toFixed(2)}
-Standard Deviation: ${disp.stdDev.toFixed(2)}
-`.trim()
-  );
+  printMetricBlock("INFORMATION FLOW METRICS",
+    `Function Count: ${infoFlowSummary.functionCount}
+Total Fan-In: ${infoFlowSummary.totalFanIn}
+Total Fan-Out: ${infoFlowSummary.totalFanOut}
+Total Information Flow: ${infoFlowSummary.totalInfoFlow}
+Grand Total: ${infoFlowSummary.grandTotal}`);
 
-  // UPDATED: Information Flow Table (matches image)
-  printMetricBlock(
-    "INFORMATION FLOW METRICS",
-    `
-Function Count: ${infoFlowSummary.functionCount.toFixed(2)}
-Total Fan-In: ${infoFlowSummary.totalFanIn.toFixed(2)}
-Total Fan-Out: ${infoFlowSummary.totalFanOut.toFixed(2)}
-Average Fan-In: ${(infoFlowSummary.totalFanIn / (infoFlowSummary.functionCount || 1)).toFixed(2)}
-Average Fan-Out: ${(infoFlowSummary.totalFanOut / (infoFlowSummary.functionCount || 1)).toFixed(2)}
-Total Information Flow: ${infoFlowSummary.totalInfoFlow.toFixed(2)}
-Grand Total: ${infoFlowSummary.grandTotal.toFixed(2)}
-`.trim()
-  );
+  printMetricBlock("LIVE VARIABLE ANALYSIS",
+    `Total Variables Declared: ${totalVarsDeclared}
+Maximum Live Variables (Peak): ${maxLiveVars}
+Average Live Variables: ${(totalLiveVars / (liveFileCount || 1)).toFixed(2)}`);
 
-  printMetricBlock(
-    "LIVE VARIABLE ANALYSIS",
-    `
-Total Variables Declared: ${totalVarsDeclared}
-Total Lines of Code: ${totalLOCForLive}
-Maximum Live Variables (peak): ${maxLiveVars}
-Average Live Variables: ${(totalLiveVars / (liveFileCount || 1)).toFixed(2)}
-`.trim()
-  );
+  /* UPDATED: Interoperability Index printed explicitly */
+  printMetricBlock("INTEROPERABILITY INDEX",
+    `Interoperability Index: ${interoperabilityScore.toFixed(2)}%`);
 
-  printMetricBlock(
-    "INTEROPERABILITY SCORE",
-    `Interoperability Score: ${interoperabilityScore.toFixed(2)}%`
-  );
+  /* ===================== CSV REPORT ===================== */
+  const csvReport = {
+    "Files Analyzed": files.length,
+    "Total LOC": totalLOC,
+    "Halstead Volume": totalHalstead.volume.toFixed(2),
+    "Cyclomatic Complexity": ccTotal,
+    "Maintainability Index": MI.toFixed(2),
+    "Function Count": infoFlowSummary.functionCount,
+    "Total Fan-In": infoFlowSummary.totalFanIn,
+    "Total Fan-Out": infoFlowSummary.totalFanOut,
+    "Total Information Flow": infoFlowSummary.totalInfoFlow,
+    "Grand Total": infoFlowSummary.grandTotal,
+    "Total Variables Declared": totalVarsDeclared,
+    "Max Live Variables": maxLiveVars,
+    "Average Live Variables": (totalLiveVars / (liveFileCount || 1)).toFixed(2),
+    "Interoperability Index (%)": interoperabilityScore.toFixed(2)
+  };
+
+  const outPath = path.join(process.cwd(), "metrics_report.csv");
+  writeCSV(csvReport, outPath);
+
+  console.log(`\nCSV report generated at: ${outPath}`);
 
   rl.close();
 });
