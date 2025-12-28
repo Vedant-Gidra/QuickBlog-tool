@@ -1,0 +1,15 @@
+Metric,Value
+Files Analyzed,44
+Total LOC,8008
+Halstead Volume,3561.92
+Cyclomatic Complexity,23
+Maintainability Index,22.42
+Function Count,33
+Total Fan-In,11
+Total Fan-Out,1
+Total Information Flow,0
+Grand Total,12
+Total Variables Declared,52
+Max Live Variables,9
+Average Live Variables,2.07
+Interoperability Index (%),84.00
